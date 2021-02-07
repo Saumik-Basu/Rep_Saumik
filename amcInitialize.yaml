@@ -1,0 +1,74 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: "The following template creates the required resources for the initial enablement of an AMC instance.
+              It creates the S3 Bucket and S3 Bucket policy with prescribed parameter values 
+              to enable cross account write access for AMC."
+
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "AMC Provided Initialization Values"
+        Parameters:
+          - pBucketName
+          - pAmcAwsAccountId
+
+    ParameterLabels:
+      pBucketName:
+        default: "[DO NOT MODIFY] The AMC instance is pre-configured to point to this specific bucket name."
+      pAmcAwsAccountId:
+        default: "[DO NOT MODIFY] Specifies the AWS Account ID of the AMC instance that will be writing to the S3 bucket"
+
+Parameters:
+  pBucketName:
+    Type: String
+    Description: Creates the S3 Bucket with the required name configured to work with the AMC instance. This should be the bucket name for the AMC instance
+  pAmcAwsAccountId:
+    Type: String
+    Description: 'The AWS account ID of the AMC instance that is given PutObject access to the S3 bucket created in the template. This should be the orange AWS Account number listed for the instance'
+
+Resources:
+  rS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref pBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  rS3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref rS3Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Id: AggregationDeliveryPolicy
+        Statement:
+        - Sid: AggregationDelivery
+          Effect: Allow
+          Principal:
+            AWS: !Sub arn:aws:iam::${pAmcAwsAccountId}:root
+          Action:
+          - s3:PutObject
+          - s3:PutObjectAcl
+          Resource: !Sub arn:aws:s3:::${pBucketName}/*
+        - Sid: AggregationOwnerAccess
+          Effect: Allow
+          Principal:
+            AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+          Action: s3:*
+          Resource:
+          - !Sub arn:aws:s3:::${pBucketName}/*
+          - !Sub arn:aws:s3:::${pBucketName} 
+
+Outputs:
+  oAmcBucketName:
+    Value: !Sub ${pBucketName}
+    Export: 
+      Name: !Sub ${AWS::StackName}-amcbucket     

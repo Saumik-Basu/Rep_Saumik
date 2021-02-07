@@ -1,0 +1,2195 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: "AWS::Serverless-2016-10-31"
+Description: "Resources to be created by the pipeline stack"
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "AMC Provided Initialization Values"
+        Parameters:
+          - pAmcBucketName
+          - pAMCInstanceID
+          - pAMCAPIEndPointUrl
+          - pAMCOrangeAccountNumber
+          - pAMCGreenAccountNumber
+          - pAMCBlueAccountNumber
+
+    ParameterLabels:
+      pAmcBucketName:
+        default: "S3 Bucket AMC Instance is writing to"
+      pAMCInstanceID:
+        default: "AMC Instance ID"
+      pAMCAPIEndPointUrl:
+        default: "AMC API Endpoint URL"
+      pAMCOrangeAccountNumber:
+        default: "Orange AWS Account Number for AMC Instance"
+      pAMCGreenAccountNumber:
+        default: "Green AWS Account Number for AMC Instance"
+      pAMCBlueAccountNumber:
+        default: "Blue AWS Account Number for AMC Instance"
+
+Parameters:
+  pEnvironment:
+    Description: "Environment name."
+    Type: String
+    Default: "dev"
+    AllowedValues: ["dev", "test", "prod"]
+  pOrganizationName:
+    Description: "Name of the organization (all lowercase, no symbols or spaces)"
+    Type: String
+    AllowedPattern: '[a-z0-9]{2,16}'
+  pApplicationName:
+    Description: "Name of the application (all lowercase, no symbols or spaces)"
+    Type: String
+    AllowedPattern: '[a-z0-9]{2,10}'
+    Default: "datalake"
+  pAmcBucketName:
+    Description: "This should be the Bucket listed for the instance"
+    Type: String
+    Default: "test-amc-output"
+  pAMCInstanceID:
+    Description: "This should be the AMC ID listed for the instance"
+    Type: "String"
+    Default: "fake"
+  pAMCAPIEndPointUrl:
+    Description: "This should be the API endpoint listed for the instance e.g. https://fake2.execute-api.${AWS::Region}.amazonaws.com/prod"
+    Type: "String"
+    Default: "https://fake.execute-api.us-east-1.amazonaws.com/prod"
+  pAMCOrangeAccountNumber:
+    Description: "The AWS account ID of the AMC instance that is given PutObject access to the S3 bucket created in the template. This should be the orange AWS Account number listed for the instance"
+    Type: "String"
+    AllowedPattern: '[0-9]{12,12}'
+    Default: "000000000001"
+  pAMCGreenAccountNumber:
+    Description: "This should be the green AWS Account number listed for the instance"
+    Type: "String"
+    AllowedPattern: '[0-9]{12,12}'
+    Default: "000000000002"
+  pAMCBlueAccountNumber:
+    Description: "This should be the Blue AWS Account number listed for the instance"
+    Type: "String"
+    AllowedPattern: '[0-9]{12,12}'
+    Default: "000000000003"
+  pDataset:
+    Description: "Dataset Name"
+    Type: String
+    AllowedPattern: '[a-z0-9]{2,10}'
+    Default: amc
+  pArtifactBucket:
+    Description: "Name of the Bucket that contains artifacts for Lambda code, layers, etc."
+    Type: String
+    Default: ats-artifacts
+  pArtifactDirectory:
+    Description: "Directory name within the artifact bucket that contains Lambda code, layers, etc. e.g."
+    Type: String
+    Default: "amc-quickstart-1.1"
+  pCrawlerScheduleTimeZone:
+    Description: "specifies timezone for scheduling glue crawler jobs should match timezone of the region being used for glue crawlers"
+    Type: "String"
+    Default: America/New_York
+  pCrawlerRunDelaySeconds:
+    Description: "the amount of time in seconds that glue will wait to execute a crawler after it has been requested (to avoid multiple runs within a short window of time)"
+    Type: "String"
+    Default: 90
+  pSnsEmailSubscriber:
+    Description: The email address that receives notifications from the created SNS topic.
+    Type: String
+    Default : "nobody@amazon.com"
+
+Resources:
+  rSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, "topic"]]
+      Subscription:
+        - Endpoint: !Ref pSnsEmailSubscriber
+          Protocol: email
+      Tags:
+        -
+          Key: 'tagging-policy'
+          Value: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "common"]]
+
+###### Add Bucket Notifications to AMC Bucket #######
+  rCustomLambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-PutBucketNotification-Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - s3:PutBucketNotification
+              Resource:
+              - !Sub "arn:aws:s3:::${pAmcBucketName}"
+      Tags:
+        -
+          Key: 'tagging-policy'
+          Value: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "common"]]
+
+  rPutBucketNotification:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-PutBucketNotification
+      Description: Put Bucket Notification
+      Handler: index.putBucketNotification
+      Environment:
+        Variables:
+          bucketName: !Ref pAmcBucketName
+          queueArn: !GetAtt rQueueRouting.Arn
+      Runtime: python3.6
+      Role: !GetAtt rCustomLambdaExecutionRole.Arn
+      Code:
+        ZipFile: !Sub |
+            import boto3
+            import cfnresponse
+            import os
+
+            def putBucketNotification(event, context):
+              client = boto3.client('s3')
+              bucketName=os.environ['bucketName']
+              queueArn=os.environ['queueArn']
+
+              if (event["RequestType"] != "Delete"):
+                response = client.put_bucket_notification_configuration(
+                  Bucket=bucketName,
+                  NotificationConfiguration={
+                    'QueueConfigurations': [
+                      {
+                        'Id':'CsvPutEvent',
+                        'QueueArn': queueArn,
+                        'Events': [
+                          's3:ObjectCreated:*'
+                        ],
+                        'Filter':{
+                          'Key':{
+                            'FilterRules':[
+                            {
+                              'Name':'suffix',
+                              'Value': '.csv'
+                            }
+                            ]
+                            }
+                          }
+                      },
+                      {
+                        'Id':'JsonPutEvent',
+                        'QueueArn': queueArn,
+                        'Events': [
+                          's3:ObjectCreated:*'
+                        ],
+                        'Filter':{
+                          'Key':{
+                            'FilterRules':[
+                            {
+                              'Name':'suffix',
+                              'Value': '.json'
+                            },
+                            {
+                                'Name':'prefix',
+                                'Value': 'import/'
+                              }
+                            ]
+                            }
+                          }
+                      },
+                    ]
+                  }
+                )
+
+                responseData = {"Data": "OK"}
+
+              else:
+                print("RequestType %s, nothing to do" % event["RequestType"])
+                responseData = {"Data": "OK"}
+
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+
+      Tags:
+        -
+          Key: 'tagging-policy'
+          Value: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "common"]]
+
+  rCustomResourcePutBucketNotification:
+    Type: Custom::rPutBucketNotification
+    Properties:
+      ServiceToken: !GetAtt rPutBucketNotification.Arn
+      Tags:
+        -
+          Key: 'tagging-policy'
+          Value: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "common"]]
+
+  rCustomResourceCopyS3FileEmailSubscriptionsConfig:
+    Type: Custom::rLambdaCustomResourceCopyS3File
+    Properties:
+      ServiceToken: !GetAtt rLambdaCustomResourceCopyS3File.Arn
+      SourceBucket: !Ref pArtifactBucket
+      SourceKey: !Sub '${pArtifactDirectory}/config/workflow_email_subscriptions.json'
+      TargetBucket: !Sub pAmcBucketName
+      TargetKey: '/config/workflow_email_subscriptions.json'
+      Tags:
+        -
+          Key: 'tagging-policy'
+          Value: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "common"]]
+
+####### S3 #########
+  rStageBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref 'AWS::Region', !Ref 'AWS::AccountId', 'stage']]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+      Tags:
+        -
+          Key: 'tagging-policy'
+          Value: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "common"]]
+
+  rAnalyticsBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref 'AWS::Region', !Ref 'AWS::AccountId', 'analytics']]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+      Tags:
+        -
+          Key: 'tagging-policy'
+          Value: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "common"]]
+
+###### SQS ######
+  rQueueRouting:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "routing", "queue"]]
+      VisibilityTimeout: 30
+      DelaySeconds: 10
+      Tags:
+        -
+          Key: 'tagging-policy'
+          Value: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "common"]]
+##################
+
+######## IAM #########
+
+######SQS Queue Policy*######
+  rQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 's3.amazonaws.com'
+            Action:
+              - SQS:SendMessage
+            Resource: !GetAtt rQueueRouting.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub 'arn:aws:s3:::${pAmcBucketName}'
+              StringEquals:
+                aws:SourceAccount: !Ref 'AWS::AccountId'
+          - Effect: Allow
+            Principal:
+              Service: 's3.amazonaws.com'
+            Action:
+              - SQS:SendMessage
+            Resource: !GetAtt rQueueRouting.Arn
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref 'AWS::AccountId'
+          - Effect: Deny
+            Principal:
+              Service: 's3.amazonaws.com'
+            Action:
+              - SQS:SendMessage
+            Resource: !GetAtt rQueueRouting.Arn
+            Condition:
+              StringNotEquals:
+                aws:SourceAccount: !Ref 'AWS::AccountId'
+      Queues:
+        - !Ref rQueueRouting  
+### REMOVE OLD QUEUE POLICY ####
+
+
+######## IAM Policies ##########
+
+### API Gateway Execute API ###
+  rAPIGatewayInvokeAMCApiPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties: 
+      Description: !Sub "Allows API Invoke on the AMC API Endpoints"
+      ManagedPolicyName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, "ApiGateway", "AMCAPIInvoke"]]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - "execute-api:Invoke"
+            Resource:
+              - !Join ['', ["arn:aws:execute-api:", !Select [2, !Split [ '.',  !Select [ 2, !Split [ '/', !Sub '${pAMCAPIEndPointUrl}'] ]]], !Sub ":${pAMCOrangeAccountNumber}:", !Select [0, !Split [ '.',  !Select [ 2, !Split [ '/', !Sub '${pAMCAPIEndPointUrl}'] ]]], "/*"]]
+              - !Join ['', ["arn:aws:execute-api:", !Select [2, !Split [ '.',  !Select [ 2, !Split [ '/', !Sub '${pAMCAPIEndPointUrl}'] ]]], !Sub ":${pAMCGreenAccountNumber}:", !Select [0, !Split [ '.',  !Select [ 2, !Split [ '/', !Sub '${pAMCAPIEndPointUrl}'] ]]], "/*"]]
+              - !Join ['', ["arn:aws:execute-api:", !Select [2, !Split [ '.',  !Select [ 2, !Split [ '/', !Sub '${pAMCAPIEndPointUrl}'] ]]], !Sub ":${pAMCBlueAccountNumber}:", !Select [0, !Split [ '.',  !Select [ 2, !Split [ '/', !Sub '${pAMCAPIEndPointUrl}'] ]]], "/*"]]
+
+### S3 AMC Staging Read Write ###
+  rS3AMCStagingReadWrite:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties: 
+      Description: !Sub "Allows Read Write access to the AMC Analytics Bucket"
+      ManagedPolicyName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, "S3", "StagingRW"]]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Sid: GetListBucket
+            Action:
+              - "s3:ListBucket"
+              - "s3:GetBucketLocation"
+              - "s3:HeadBucket"
+            Resource:
+              - !GetAtt rStageBucket.Arn
+          - Effect: Allow
+            Sid: ReadWriteObjects
+            Action:
+              - "s3:DeleteObjectVersion"
+              - "s3:RestoreObject"
+              - "s3:PutObjectVersionTagging"
+              - "s3:PutObjectLegalHold"
+              - "s3:UpdateJobStatus"
+              - "s3:ListMultipartUploadParts"
+              - "s3:ListJobs"
+              - "s3:ReplicateObject"
+              - "s3:PutObject"
+              - "s3:GetObjectAcl"
+              - "s3:GetObject"
+              - "s3:AbortMultipartUpload"
+              - "s3:DescribeJob"
+              - "s3:PutObjectRetention"
+              - "s3:UpdateJobPriority"
+              - "s3:GetObjectTagging"
+              - "s3:PutObjectTagging"
+              - "s3:PutBucketObjectLockConfiguration"
+              - "s3:DeleteObject"
+              - "s3:ReplicateDelete"
+              - "s3:GetObjectVersion"
+            Resource:              
+              - !Join ['/',[!GetAtt rStageBucket.Arn,"*"]]
+
+
+### S3 Analytics Read Write Access ###
+  rS3AnalyticsBucketReadWrite:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties: 
+      Description: !Sub "Allows Read Write access to the AMC Analytics Bucket"
+      ManagedPolicyName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, "S3", "AnalyticsRW"]]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Sid: GetListBucket
+            Action:
+              - "s3:ListBucket"
+              - "s3:GetBucketLocation"
+              - "s3:HeadBucket"
+            Resource:
+              - !GetAtt rAnalyticsBucket.Arn
+          - Effect: Allow
+            Sid: ReadWriteObjects
+            Action:
+              - "s3:DeleteObjectVersion"
+              - "s3:RestoreObject"
+              - "s3:PutObjectVersionTagging"
+              - "s3:PutObjectLegalHold"
+              - "s3:UpdateJobStatus"
+              - "s3:ListMultipartUploadParts"
+              - "s3:ListJobs"
+              - "s3:ReplicateObject"
+              - "s3:PutObject"
+              - "s3:GetObjectAcl"
+              - "s3:GetObject"
+              - "s3:AbortMultipartUpload"
+              - "s3:DescribeJob"
+              - "s3:PutObjectRetention"
+              - "s3:UpdateJobPriority"
+              - "s3:GetObjectTagging"
+              - "s3:PutObjectTagging"
+              - "s3:PutBucketObjectLockConfiguration"
+              - "s3:DeleteObject"
+              - "s3:ReplicateDelete"
+              - "s3:GetObjectVersion"
+            Resource:              
+              - !Join ['/',[!GetAtt rAnalyticsBucket.Arn,"*"]]
+              
+### S3 AMC Import ReadWrite Access ###
+  rS3AMCImportReadWriteAccess:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties: 
+      Description: !Sub "Allows Read and Write access to the Import directory in the AMC Bucket"
+      ManagedPolicyName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, "S3", "AMCImportRW"]]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Sid: GetListBucket
+            Action:
+              - "s3:ListBucket"
+              - "s3:GetBucketLocation"
+              - "s3:HeadBucket"
+            Resource:
+              - !Sub "arn:aws:s3:::${pAmcBucketName}"
+          - Effect: Allow
+            Sid: ReadWriteObjects
+            Action:
+              - "s3:DeleteObjectVersion"
+              - "s3:RestoreObject"
+              - "s3:PutObjectVersionTagging"
+              - "s3:PutObjectLegalHold"
+              - "s3:UpdateJobStatus"
+              - "s3:ListMultipartUploadParts"
+              - "s3:ListJobs"
+              - "s3:ReplicateObject"
+              - "s3:PutObject"
+              - "s3:GetObjectAcl"
+              - "s3:GetObject"
+              - "s3:AbortMultipartUpload"
+              - "s3:DescribeJob"
+              - "s3:PutObjectRetention"
+              - "s3:UpdateJobPriority"
+              - "s3:GetObjectTagging"
+              - "s3:PutObjectTagging"
+              - "s3:PutBucketObjectLockConfiguration"
+              - "s3:DeleteObject"
+              - "s3:ReplicateDelete"
+              - "s3:GetObjectVersion"
+            Resource:              
+              - !Sub "arn:aws:s3:::${pAmcBucketName}/import/*"
+
+
+### Athena S3 Glue AMC Policy ###
+  rAthenaS3GlueAMCPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties: 
+      Description: !Sub "Allows Write access to Athena Results Directory in the Analytics Bucket"
+      ManagedPolicyName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, "S3", "AthenaPolicy"]]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Sid: S3WriteAthenaResults
+            Action:
+              - "s3:PutObject"
+              - "s3:AbortMultipartUpload"
+              - "s3:ListMultipartUploadParts"
+            Resource:
+              - !Join ['/',[!GetAtt rAnalyticsBucket.Arn,"athena_query_results","*"]]
+          - Effect: Allow
+            Sid: ReadGlueCatalog
+            Action:
+              - "glue:Get*"
+            Resource: 
+              - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+          - Effect: Allow
+            Sid: ReadGlueDatabaseAndTable
+            Action:
+              - "glue:Get*"
+            Resource: 
+              - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${rGlueDataCatalog}"
+              - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${rGlueDataCatalog}/*"
+          - Effect: Allow
+            Sid: UpdateGlueTable
+            Action:
+              - "glue:UpdateTable"
+              - "glue:DeleteTable"
+              - "glue:DeletePartition"
+              - "glue:UpdatePartition"
+            Resource: 
+              - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${rGlueDataCatalog}/*"
+
+          - Effect: Allow
+            Sid: AthenaWorkgroupQueryExecutionPermissions
+            Action:
+              - "athena:GetNamedQuery"
+              - "athena:CancelQueryExecution"
+              - "athena:CreateNamedQuery"
+              - "athena:DeleteNamedQuery"
+              - "athena:StartQueryExecution"
+              - "athena:StopQueryExecution"
+              - "athena:GetWorkGroup"
+              - "athena:GetNamedQuery"
+              - "athena:GetQueryResults"
+              - "athena:GetQueryExecution"
+              - "athena:BatchGetQueryExecution"
+              - "athena:BatchGetNamedQuery"
+              - "athena:ListNamedQueries"
+              - "athena:ListQueryExecutions"
+              - "athena:GetQueryResultsStream"
+            Resource: 
+              - !Sub "arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${rAthenaWorkGroup}"
+
+### S3 Read AMC Output ###
+  rS3ReadAMCOutput:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties: 
+      Description: "Allows read only access the AMC output bucket"
+      ManagedPolicyName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, "S3", "ReadAMCOutput"]]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Sid: BucketReadpermissions
+            Action:
+              - "s3:ListBucket"
+              - "s3:GetBucketLocation"
+              - "s3:ListBucket"
+              - "s3:ListBucketMultipartUploads"
+              - "s3:HeadBucket"
+            Resource:
+              - !Sub "arn:aws:s3:::${pAmcBucketName}"
+          - Effect: Allow
+            Sid : ObjectReadPermissions
+            Action:
+              - "s3:GetObject"
+              - "s3:GetObjectVersion"
+            Resource:
+              - !Sub "arn:aws:s3:::${pAmcBucketName}/*"
+
+
+### S3 Read AMC Staging ###
+  rS3ReadAMCStaging:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties: 
+      Description: "Allows read  access to the AMC Staging bucket"
+      ManagedPolicyName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, "S3", "ReadAMCStaging"]]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Sid: BucketReadpermissions
+            Action:
+              - "s3:ListBucket"
+              - "s3:GetBucketLocation"
+              - "s3:ListBucket"
+              - "s3:ListBucketMultipartUploads"
+              - "s3:HeadBucket"
+            Resource:
+              - !GetAtt rStageBucket.Arn
+          - Effect: Allow
+            Sid : ObjectReadPermissions
+            Action:
+              - "s3:GetObject"
+              - "s3:GetObjectVersion"
+            Resource:
+              - !Join ['/',[!GetAtt rStageBucket.Arn,"*"]]
+
+### S3 Read AMC Analytics ###
+  rS3ReadAMCAnalytics:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties: 
+      Description: "Allows read  access to the AMC Staging bucket"
+      ManagedPolicyName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, "S3", "ReadAMCAnalytics"]]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Sid: BucketReadpermissions
+            Action:
+              - "s3:ListBucket"
+              - "s3:GetBucketLocation"
+              - "s3:ListBucket"
+              - "s3:ListBucketMultipartUploads"
+              - "s3:HeadBucket"
+            Resource:
+              - !GetAtt rStageBucket.Arn
+          - Effect: Allow
+            Sid : ObjectReadPermissions
+            Action:
+              - "s3:GetObject"
+              - "s3:GetObjectVersion"
+            Resource:
+              - !Join ['/',[!GetAtt rAnalyticsBucket.Arn,"*"]]
+
+### Secrets Manager Read Access ###
+  rSecretsManagerReadOnlyPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties: 
+      Description: !Sub "Allows read access to the ${pOrganizationName} ${pApplicationName} ${pEnvironment} ${pDataset} Secrets Manager secrets"
+      ManagedPolicyName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, "SecretsManager", "S3SigningCredentials"]]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetResourcePolicy
+              - "secretsmanager:GetSecretValue"
+              - "secretsmanager:DescribeSecret"
+              - "secretsmanager:ListSecretVersionIds"
+              - "secretsmanager:GetRandomPassword"
+            Resource:
+              - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${pOrganizationName}-${pApplicationName}-${pEnvironment}-${pDataset}-*"
+
+### DynamoDB Full Access ###
+  rDynamoDBFullAccessPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties: 
+      Description: !Sub "Allows Full access to the ${pOrganizationName} ${pApplicationName} ${pEnvironment} ${pDataset} DynamoDB Tables"
+      ManagedPolicyName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, "DynamoDB", "FullAccess"]]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - "dynamodb:*"
+            Resource:
+              - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${pOrganizationName}_${pApplicationName}_${pEnvironment}_${pDataset}_*"
+
+### DynamoDB Full Access ###
+  rDynamoDBReadAccessPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties: 
+      Description: !Sub "Allows Read Only to the ${pOrganizationName} ${pApplicationName} ${pEnvironment} ${pDataset} DynamoDB Tables"
+      ManagedPolicyName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, "DynamoDB", "ReadAccess"]]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - "dynamodb:BatchGetItem"
+              - "dynamodb:ConditionCheckItem"
+              - "dynamodb:ListTables"
+              - "dynamodb:Scan"
+              - "dynamodb:ListTagsOfResource"
+              - "dynamodb:Query"
+              - "dynamodb:DescribeStream"
+              - "dynamodb:DescribeTimeToLive"
+              - "dynamodb:ListStreams"
+              - "dynamodb:DescribeGlobalTableSettings"
+              - "dynamodb:ListGlobalTables"
+              - "dynamodb:DescribeTable"
+              - "dynamodb:GetShardIterator"
+              - "dynamodb:DescribeGlobalTable"
+              - "dynamodb:DescribeReservedCapacity"
+              - "dynamodb:GetItem"
+              - "dynamodb:DescribeLimits"
+              - "dynamodb:GetRecords"
+              - "dynamodb:DescribeTableReplicaAutoScaling"
+            Resource:
+              - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${pOrganizationName}_${pApplicationName}_${pEnvironment}_${pDataset}_*"
+
+
+### SQS Full Access ###
+  rSQSFullAccessPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties: 
+      Description: !Sub "Allows Full access to the ${pOrganizationName} ${pApplicationName} ${pEnvironment} ${pDataset} SQS Queues"
+      ManagedPolicyName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, "SQS", "FullAccess"]]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - "sqs:List*"
+              - "sqs:ReceiveMessage"
+              - "sqs:SendMessage*"
+              - "sqs:DeleteMessage*"
+              - "sqs:GetQueue*"
+            Resource:
+              - !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${pOrganizationName}-${pApplicationName}-${pEnvironment}-${pDataset}-*"
+
+### State machines Full Access ###
+  rSMAMCStartExecution:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties: 
+      Description: !Sub "Allows Full access to the ${pOrganizationName} ${pApplicationName} ${pEnvironment} ${pDataset} State Machines"
+      ManagedPolicyName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "SM", "StartExecution"]]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - "states:StartExecution"
+            Resource:
+              - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${pOrganizationName}-${pApplicationName}-${pEnvironment}-${pDataset}-*"
+
+
+### Invoke Lambda Policy ###
+  rInvokeLambdaPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties: 
+      Description: !Sub "Allows InvokeFunction access to the ${pOrganizationName} ${pApplicationName} ${pEnvironment} ${pDataset} Lambda Functions"
+      ManagedPolicyName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "Lambda", "Invoke"]]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - "lambda:InvokeFunction"
+            Resource:
+              - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${pOrganizationName}-${pApplicationName}-${pEnvironment}-${pDataset}-*"
+
+### Pass IAM Role Policy ###
+  rPassIamRolePolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties: 
+      Description: !Sub "Allows passing of IAM roles to service roles for ${pOrganizationName} ${pApplicationName} ${pEnvironment} ${pDataset}"
+      ManagedPolicyName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "Lambda", "PassIamRole"]]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - "iam:PassRole"
+            Resource:
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/service-role/${pOrganizationName}-${pApplicationName}-${pEnvironment}-${pDataset}-*"
+
+######## IAM Groups ##########
+  rGroupAMCAnalyst:
+    Type: AWS::IAM::Group
+    Properties: 
+      GroupName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "AMCAnalystGroup"]]
+      ManagedPolicyArns:
+        - !Ref rAthenaS3GlueAMCPolicy
+        - !Ref rS3ReadAMCOutput
+        - !Ref rS3ReadAMCStaging
+        - !Ref rS3ReadAMCAnalytics
+        - !Ref rS3AMCImportReadWriteAccess
+        - !Ref rS3AnalyticsBucketReadWrite
+        - !Ref rDynamoDBReadAccessPolicy
+        - !Ref rAPIGatewayInvokeAMCApiPolicy
+          
+  rRoleLambdaExecutionRouting:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Description: !Sub "Allows Full S3, SQS, and State machine full access to Lambda functions for ${pOrganizationName} ${pApplicationName} ${pEnvironment} ${pDataset}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - !Ref rSMAMCStartExecution
+        - !Ref rS3ReadAMCOutput
+        - !Ref rS3AMCStagingReadWrite
+        - !Ref rAthenaS3GlueAMCPolicy
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, "SQS", "FullAccess"]]
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "sqs:List*"
+                  - "sqs:ReceiveMessage"
+                  - "sqs:SendMessage*"
+                  - "sqs:DeleteMessage*"
+                  - "sqs:GetQueue*"
+                Resource:
+                  - !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${pOrganizationName}-${pApplicationName}-${pEnvironment}-${pDataset}-*"
+      Tags:
+        -
+          Key: 'tagging-policy'
+          Value: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "common"]]
+
+  rDatalakeCrawlerRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Description: !Sub "Allows Crawlers to full access to S3 buckets for ${pOrganizationName} ${pApplicationName} ${pEnvironment} ${pDataset}"
+      RoleName: !Sub ${pOrganizationName}-${pApplicationName}-${pEnvironment}-${pDataset}-AWSGlueServiceRole-crawler
+      Path: "/service-role/"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "glue.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole"
+        - !Ref rS3ReadAMCOutput
+        - !Ref rS3ReadAMCStaging
+        - !Ref rS3ReadAMCAnalytics
+      Tags:
+        -
+          Key: 'tagging-policy'
+          Value: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "common"]]
+
+  rRoleLambdaExecution:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Description: !Sub "Allows Lambda functions access to Glue, Step Functions, S3 and DynamoDB and Invoke Lambda functions for ${pOrganizationName} ${pApplicationName} ${pEnvironment} ${pDataset}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - !Ref rS3ReadAMCOutput
+        - !Ref rS3ReadAMCStaging
+        - !Ref rS3ReadAMCAnalytics
+        - !Ref rSMAMCStartExecution
+        - !Ref rInvokeLambdaPolicy
+        - !Ref rAPIGatewayInvokeAMCApiPolicy
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+        - arn:aws:iam::aws:policy/AWSGlueConsoleFullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonSESFullAccess
+      Policies:
+        - PolicyName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, "SNS", "Publish"]]
+          PolicyDocument: 
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "sns:Publish"
+                Resource:
+                  - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${rSnsTopic.TopicName}"
+        - PolicyName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, "DynamoDB", "FullAccess"]]
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:*"
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${pOrganizationName}_${pApplicationName}_${pEnvironment}_${pDataset}_*"
+        - PolicyName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, "SecretsManager", "S3SigningCredentials"]]
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetResourcePolicy
+                  - "secretsmanager:GetSecretValue"
+                  - "secretsmanager:DescribeSecret"
+                  - "secretsmanager:ListSecretVersionIds"
+                  - "secretsmanager:GetRandomPassword"
+                Resource:
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${pOrganizationName}-${pApplicationName}-${pEnvironment}-${pDataset}-*"
+        - PolicyName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "Lambda", "PassIamRole"]]
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "iam:PassRole"
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/service-role/${pOrganizationName}-${pApplicationName}-${pEnvironment}-${pDataset}-*"
+
+      Tags:
+        -
+          Key: 'tagging-policy'
+          Value: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "common"]]
+
+  rRoleStateMachine:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub ${pOrganizationName}-StateMachineRole-${pApplicationName}-${pDataset}-crawler
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "states.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, "SM-SNS", "Publish"]]
+          PolicyDocument: 
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "sns:Publish"
+                Resource:
+                  - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${rSnsTopic.TopicName}"
+      ManagedPolicyArns:
+        - !Ref rSMAMCStartExecution
+        - !Ref rInvokeLambdaPolicy
+      Tags:
+        -
+          Key: 'tagging-policy'
+          Value: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "common"]]
+
+######## IAM User ########
+  rS3SigningUser:
+    Type: AWS::IAM::User
+    Properties: 
+      UserName : !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "S3SigningUser"]]
+      ManagedPolicyArns: 
+        - !Ref rS3ReadAMCOutput
+      Tags:
+        -
+          Key: 'tagging-policy'
+          Value: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "common"]]
+
+######IAM AccessKey########
+  rS3SigningUserCredentials:
+    Type: AWS::IAM::AccessKey
+    Properties: 
+      UserName: !Ref rS3SigningUser
+
+##### Secrets Manager Secret #####
+  S3SigningCredentialsSecret:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "S3SigningSecret"]]
+      Description: This secret has a hardcoded password in SecretString (use GenerateSecretString instead)
+      SecretString: !Sub '{"aws_access_key_id":"${rS3SigningUserCredentials}","aws_secret_access_key":"${rS3SigningUserCredentials.SecretAccessKey}"}'
+      Tags:
+        -
+          Key: 'tagging-policy'
+          Value: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "common"]]
+
+
+######## GLUE #########
+  rGlueDataCatalog:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Description: Database to hold some data
+        Name: !Join ['_', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "db"]]
+
+######## Athena #############
+  rAthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties: 
+      Description: Athena Workgroup for accessing AMC Data
+      Name: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, "AMC"]]
+      State: ENABLED
+      Tags: 
+        -
+          Key: 'tagging-policy'
+          Value: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "common"]]
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: false
+        PublishCloudWatchMetricsEnabled: false
+        RequesterPaysEnabled: true
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${rAnalyticsBucket}/athena_query_results/"
+
+
+
+#### LAMBDA LAYERS ########
+  rLambdaLayerAWSWrangler:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes:
+        - python3.6
+      Content:
+        S3Bucket: !Ref pArtifactBucket
+        S3Key: !Sub '${pArtifactDirectory}/lambda layers/awswrangler-layer-1.6.3-py3.6.zip'
+      Description: awswrangler version 1.6.3 for Python 3.6
+      LayerName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "awswrangler-layer-163-py36"]] 
+      LicenseInfo: "Apache License Version 2.0"
+
+  rLambdaLayercrhelper:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes:
+        - python3.6
+      Content:
+        S3Bucket: !Ref pArtifactBucket
+        S3Key: !Sub '${pArtifactDirectory}/lambda layers/crhelper-36.zip'
+      Description: crhelper crhelper-2.0.6 for python 3.6
+      LayerName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "crhelper-36"]]
+      LicenseInfo: "Apache License Version 2.0"
+
+######## LAMBDAS ###########
+
+
+#custom-resource-copy-s3-file.zip
+  rLambdaCustomResourceCopyS3File:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri:
+        Bucket: !Ref pArtifactBucket
+        Key: !Sub '${pArtifactDirectory}/lambdas/custom-resource-copy-s3-file.zip'
+      FunctionName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "CustomResourceCopyS3File"]]
+      Layers:
+        - !Ref rLambdaLayercrhelper
+      Handler: custom-resource-copy-s3-file.lambda_handler
+      Runtime: python3.6
+      Description: "A lambda function that allows copying S3 files from cloudFormation as a custom resource"
+      MemorySize: 128
+      Timeout: 600
+      Role: !GetAtt rRoleLambdaExecution.Arn
+
+#dynamodb-workflow-tracking-trigger.zip'
+  rLambdaWorkflowStatusTrigger: # WorkflowStatusTrigger.
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri:
+        Bucket: !Ref pArtifactBucket
+        Key: !Sub '${pArtifactDirectory}/lambdas/dynamodb-workflow-tracking-trigger.zip'
+      FunctionName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "WorkflowStatusTrigger"]]
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref rSnsTopic
+          IGNORE_STATUS_LIST: "PENDING,RUNNING,SUCCEEDED,PUBLISHING"
+
+      Handler: dynamodb-workflow-tracking-trigger.lambda_handler
+      Runtime: python3.6
+      Description: "A lambda function that process a DynamoDB Stream of workflow statuses to generate alerts"
+      MemorySize: 128
+      Timeout: 120
+      Events:
+        Stream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt rDynamoDBAMCExecutionStatus.StreamArn
+            BatchSize: 5 # How many items we want to process at once
+            StartingPosition: TRIM_HORIZON
+      Role: !GetAtt rRoleLambdaExecution.Arn
+
+#amc-api-interface.zip'
+  rLambdaAMCAPIInterface: # amc-api-interface.
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri:
+        Bucket: !Ref pArtifactBucket
+        Key: !Sub '${pArtifactDirectory}/lambdas/amc-api-interface.zip'
+      FunctionName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "AMCApiInterface"]]
+      Environment:
+        Variables:
+          AMC_EXEUCTION_TRACKING_DYNAMODB_TABLE: !Ref rDynamoDBAMCExecutionStatus
+          DEFAULT_AMC_API_ENDPOINT_URL: !Ref pAMCAPIEndPointUrl
+          SNS_TOPIC_ARN: !Ref rSnsTopic
+          EXPIRATION_HOURS: 72
+          EXPIRATION_TIMEZONE: "America/New_York"
+          WORKFLOW_STATUS_RETENTION_DAYS: 14
+          AMC_ENDPOINT_AWS_REGION: !Select [2, !Split [ '.',  !Select [ 2, !Split [ '/', !Sub '${pAMCAPIEndPointUrl}'] ]]]
+      Handler: amc-api-interface.lambda_handler
+      Runtime: python3.6
+      Description: "A lambda interface that acts as a wrapper for the AMC REST API"
+      MemorySize: 128
+      Timeout: 600
+      Role: !GetAtt rRoleLambdaExecution.Arn
+
+#process-amc-email-subscriptions.zip
+  rLambdaAMCSubscriptions: # process-amc-email-subscriptions
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri:
+        Bucket: !Ref pArtifactBucket
+        Key: !Sub '${pArtifactDirectory}/lambdas/process-amc-email-subscriptions.zip'
+      FunctionName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "AMCSubscriptions"]]
+      Environment:
+        Variables:
+          SUBSCRIPTIONS_JSON_S3_PATH: !Sub "s3://${pAmcBucketName}/config/workflow_email_subscriptions.json"
+          EMAIL_S3_FILE_LAMBA_FUNCTION_NAME: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "EmailS3File"]]
+      Handler: process-amc-email-subscriptions.lambda_handler
+      Runtime: python3.6
+      Description: "Processes AMC Email Subscriptions"
+      MemorySize: 128
+      Timeout: 120
+      Role: !GetAtt rRoleLambdaExecution.Arn
+
+#email-s3-file.zip
+  rLambdaEmailS3File: # email-s3-file
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri:
+        Bucket: !Ref pArtifactBucket
+        Key: !Sub '${pArtifactDirectory}/lambdas/email-s3-file.zip'
+      FunctionName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "EmailS3File"]]
+      Environment:
+        Variables:
+          FILE_SIZE_LIMIT_IN_MEGABYTES: 10
+          PRESIGNED_URL_EXPIRATION_IN_SECONDS: 604800
+          S3_SIGNING_IAM_USER_CREDENTIALS_SECRET_NAME: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "S3SigningSecret"]]
+      Handler: email-s3-file.lambda_handler
+      Runtime: python3.6
+      Description: "Emails an S3 file as an attachement or Presigned URL if over the file size limit."
+      MemorySize: 256
+      Timeout: 900
+      Role: !GetAtt rRoleLambdaExecution.Arn
+
+  rLambdaRouting: # sqs-s3-event-queue-consumer
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri:
+        Bucket: !Ref pArtifactBucket
+        Key: !Sub '${pArtifactDirectory}/lambdas/sqs-s3-event-queue-consumer.zip'
+      FunctionName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "S3EventConsumer"]]
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref rStateMachineRoute
+      Handler: sqs-s3-event-queue-consumer.lambda_handler
+      Runtime: python3.6
+      Description: "Consumes messages from an SQS queue are crated from a trigger event when .csv objects are PUT into the AMC Output bucket"
+      MemorySize: 128
+      Timeout: 20
+      Role: !GetAtt rRoleLambdaExecutionRouting.Arn
+
+  rQueueLambdaEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      Enabled: True
+      EventSourceArn: !GetAtt rQueueRouting.Arn
+      FunctionName: !GetAtt rLambdaRouting.Arn
+
+  rLambdaClassifyS3Event:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri:
+        Bucket: !Ref pArtifactBucket
+        Key: !Sub '${pArtifactDirectory}/lambdas/classify-s3-event-type.zip'
+      FunctionName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "ClassifyS3EventType"]]
+      Handler: classify-s3-event-type.lambda_handler
+      Runtime: python3.6
+      Description: "Lambda to classify S3 event type"
+      MemorySize: 128
+      Timeout: 20
+      Role: !GetAtt rRoleLambdaExecution.Arn
+
+  rLambdaAmcS3Repartitioning:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri:
+        Bucket: !Ref pArtifactBucket
+        Key: !Sub '${pArtifactDirectory}/lambdas/amc-s3-repartitioning.zip'
+      Environment:
+        Variables:
+          MONTH_PARTITION_NAME: export_month
+          TARGET_BUCKET: !Ref rStageBucket
+          TARGET_DATABASE: !Ref rGlueDataCatalog
+          TARGET_OUTPUT_RAW_DIRECTORY: parquet
+          YEAR_PARTITION_NAME: export_year
+          MONTH_PARTITION_NAME: export_month
+          CRAWLER_NAME_PREFIX: !Sub ${pOrganizationName}-${pApplicationName}-${pEnvironment}-${pDataset}-
+          TABLE_PREFIX: ''
+          CRAWLER_NAME_SUFFIX: parquet
+          MODIFIED_DATE_PARTITION_NAME: file_last_modified
+      FunctionName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset,"AMCCSVRepartitioning"]]
+      Layers:
+        - !Ref rLambdaLayerAWSWrangler
+      Handler: amc-s3-repartitioning.lambda_handler
+      Runtime: python3.6
+      Description: "This function processes .csv files that are saved to an S3 location from the AMC API. the CSV data is saved as a parquet file with partitions as subdirectories in the target directory."
+      MemorySize: 384
+      Timeout: 600
+      Role: !GetAtt rRoleLambdaExecutionRouting.Arn
+
+  rLambdaAmcS3Repartitioning1G:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri:
+        Bucket: !Ref pArtifactBucket
+        Key: !Sub '${pArtifactDirectory}/lambdas/amc-s3-repartitioning.zip'
+      Environment:
+        Variables:
+          MONTH_PARTITION_NAME: export_month
+          TARGET_BUCKET: !Ref rStageBucket
+          TARGET_DATABASE: !Ref rGlueDataCatalog
+          TARGET_OUTPUT_RAW_DIRECTORY: parquet
+          YEAR_PARTITION_NAME: export_year
+          MONTH_PARTITION_NAME: export_month
+          CRAWLER_NAME_PREFIX: !Sub ${pOrganizationName}-${pApplicationName}-${pEnvironment}-${pDataset}-
+          TABLE_PREFIX: ''
+          CRAWLER_NAME_SUFFIX: parquet
+          MODIFIED_DATE_PARTITION_NAME: file_last_modified
+      FunctionName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset,"AMCCSVRepartitioning1G"]]
+      Layers:
+        - !Ref rLambdaLayerAWSWrangler
+      Handler: amc-s3-repartitioning.lambda_handler
+      Runtime: python3.6
+      Description: "This function processes .csv files that are saved to an S3 location from the AMC API. the CSV data is saved as a parquet file with partitions as subdirectories in the target directory."
+      MemorySize: 1024
+      Timeout: 600
+      Role: !GetAtt rRoleLambdaExecutionRouting.Arn
+
+  rLambdaRunWorkflowByCampaign:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri:
+        Bucket: !Ref pArtifactBucket
+        Key: !Sub '${pArtifactDirectory}/lambdas/run-workflow-by-campaign.zip'
+      Environment:
+        Variables:
+          AMC_API_INTERFACE_LAMBDA_FUNCTION_NAME: !Ref rLambdaAMCAPIInterface
+          ATHENA_WORKGROUP: !Ref rAthenaWorkGroup
+          CAMPAIGN_ATTRIBUTION_LAG_DAYS: 14
+          CAMPAIGN_LIST_DATABASE: !Ref rGlueDataCatalog
+          CAMPAIGN_LIST_TABLE: active_campaigns_advertisers_most_recent
+          MAXIMUM_CAMPAIGN_AGE_DAYS: 45
+          MINIMUM_CAMPAIGN_AGE_DAYS: 3
+      FunctionName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset,"RunWorkflowByCampaign"]]
+      Handler: run-workflow-by-campaign.lambda_handler
+      Runtime: python3.6
+      Description: "This function will invoke a specified AMC Workflow for each campaign in the specified CAMPAIGN_LIST_TABLE"
+      MemorySize: 128
+      Timeout: 900
+      Role: !GetAtt rRoleLambdaExecutionRouting.Arn
+
+
+  rLambdaFixParquetFileSchema:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri:
+        Bucket: !Ref pArtifactBucket
+        Key: !Sub '${pArtifactDirectory}/lambdas/fix_parquet_file_schema.zip'
+      Environment:
+        Variables:
+          DATABASE: !Ref rGlueDataCatalog
+      FunctionName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset,"FixParquetFileSchema"]]
+      Layers:
+        - !Ref rLambdaLayerAWSWrangler
+      Handler: fix_parquet_file_schema.lambda_handler
+      Runtime: python3.6
+      Description: "This function will update parquet files to match the table schema for a specified table"
+      MemorySize: 384
+      Timeout: 900
+      Role: !GetAtt rRoleLambdaExecutionRouting.Arn
+
+  rLambdaGetGlueCrawlerStatus:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri:
+        Bucket: !Ref pArtifactBucket
+        Key: !Sub '${pArtifactDirectory}/lambdas/get-glue-crawler-status.zip'
+      FunctionName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "GetCrawlerStatus"]]
+      Handler: get-glue-crawler-status.lambda_handler
+      Runtime: python3.6
+      Description: "Returns the status for a given cralwer"
+      MemorySize: 128
+      Timeout: 30
+      Role: !GetAtt rRoleLambdaExecution.Arn
+
+  rLambdaCreateGlueCrawler:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri:
+        Bucket: !Ref pArtifactBucket
+        Key: !Sub '${pArtifactDirectory}/lambdas/create-glue-s3-crawler.zip'
+      Environment:
+        Variables:
+          GLUE_CRAWLER_ROLE_ARN: !GetAtt rDatalakeCrawlerRole.Arn
+
+      FunctionName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "CreateS3Crawler"]]
+      Handler: create-glue-s3-crawler.lambda_handler
+      Runtime: python3.6
+      Description: "Creates a Glue Crawler that crawls a given S3 prefix (directory)"
+      MemorySize: 128
+      Timeout: 300
+      Role: !GetAtt rRoleLambdaExecution.Arn
+
+  rLambdaDeleteGlueCrawler:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri:
+        Bucket: !Ref pArtifactBucket
+        Key: !Sub '${pArtifactDirectory}/lambdas/delete-glue-crawler.zip'
+      FunctionName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "DeleteCrawler"]]
+      Handler: delete-glue-crawler.lambda_handler
+      Runtime: python3.6
+      Description: "Deletes the specified glue crawler"
+      MemorySize: 128
+      Timeout: 20
+      Role: !GetAtt rRoleLambdaExecution.Arn
+
+  rLambdaRunGlueCrawler:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri:
+        Bucket: !Ref pArtifactBucket
+        Key: !Sub '${pArtifactDirectory}/lambdas/run-glue-crawler.zip'
+      FunctionName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "RunCrawler"]]
+      Handler: run-glue-crawler.lambda_handler
+      Runtime: python3.6
+      Description: "Runs a given glue crawler specified by name"
+      MemorySize: 128
+      Timeout: 300
+      Role: !GetAtt rRoleLambdaExecution.Arn
+
+  rLambdaValidateSmallTextFiles:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri:
+        Bucket: !Ref pArtifactBucket
+        Key: !Sub '${pArtifactDirectory}/lambdas/validate-small-text-file.zip'
+      FunctionName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "ValidateTextFile"]]
+      Handler: validate-small-text-file.lambda_handler
+      Runtime: python3.6
+      Description: "counts the number of lines of a desingated S3 file and marks it as invalid if it only has 1 line (headers without data)"
+      MemorySize: 128
+      Timeout: 20
+      Role: !GetAtt rRoleLambdaExecution.Arn
+
+  rLambdaQueueCrawlerRun:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri:
+        Bucket: !Ref pArtifactBucket
+        Key: !Sub '${pArtifactDirectory}/lambdas/queue-crawler-run.zip'
+      Environment:
+        Variables:
+          GLUE_CRAWLER_DYNAMODB_TABLE: !Ref rDynamoDBGlueCrawlerStatus
+          CRAWLER_SCHEDULE_TIMEZONE: !Ref pCrawlerScheduleTimeZone
+      FunctionName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "QueueCrawlerRun"]]
+      Handler: queue-crawler-run.lambda_handler
+      Runtime: python3.6
+      Description: "Queues a crawler to run by inserting or updating the coresponding dynamodb run request record for the crawler"
+      MemorySize: 128
+      Timeout: 60
+      Role: !GetAtt rRoleLambdaExecution.Arn
+
+  rLambdaProcessGlueCrawlerRunRequests:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri:
+        Bucket: !Ref pArtifactBucket
+        Key: !Sub '${pArtifactDirectory}/lambdas/process-glue-crawler-run-requests.zip' 
+      Environment:
+        Variables:
+          GLUE_CRAWLER_DYNAMODB_TABLE: !Ref rDynamoDBGlueCrawlerStatus
+          CRAWLER_SCHEDULE_TIMEZONE: !Ref pCrawlerScheduleTimeZone
+          CRAWLER_RUN_DELAY_SECONDS: !Ref pCrawlerRunDelaySeconds
+      FunctionName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "CrawlerRunQueue"]]
+      Handler: process-glue-crawler-run-requests.lambda_handler
+      Runtime: python3.6
+      Description: "Reads all records from the GLUE_CRAWLER_DYNAMODB_TABLE that is used to request glue crawlers to be run."
+      MemorySize: 128
+      Timeout: 300
+      Role: !GetAtt rRoleLambdaExecution.Arn
+
+
+  rLambdaImportInputFile:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri:
+        Bucket: !Ref pArtifactBucket
+        Key: !Sub '${pArtifactDirectory}/lambdas/import-input-file.zip'
+      Environment:
+        Variables:
+          TARGET_BUCKET: !Ref rStageBucket
+          TARGET_DATABASE: !Ref rGlueDataCatalog
+          MODIFIED_DATE_PARTITION_NAME: file_last_modified
+          TARGET_OUTPUT_RAW_DIRECTORY: parquet 
+          CRAWLER_NAME_SUFFIX: _customparquet 
+          CRAWLER_NAME_PREFIX: !Sub ${pOrganizationName}-${pApplicationName}-${pEnvironment}-${pDataset}-
+          TABLE_PREFIX: !Sub ${pOrganizationName}_${pApplicationName}_${pEnvironment}_${pDataset}_
+      FunctionName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "ImportInputFile"]]
+      Layers:
+        - !Ref rLambdaLayerAWSWrangler
+      Handler: import-input-file.lambda_handler
+      Runtime: python3.6
+      Description: "Imports custom files with an S3 prefix of import into the target bucket as Parquet files. Creates a glue crawler to add the data to the glue catalog."
+      MemorySize: 1024
+      Timeout: 600
+      Role: !GetAtt rRoleLambdaExecutionRouting.Arn
+
+######### DynamoDB Tables #######
+  rDynamoDBGlueCrawlerStatus:
+    Type: "AWS::DynamoDB::Table"
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: crawler_name
+          AttributeType: S
+      BillingMode: PROVISIONED
+      KeySchema:
+        - AttributeName: crawler_name
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      SSESpecification:
+        SSEEnabled: False
+      TableName: !Join ['_', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "GlueCrawlerStatus"]]
+
+  rDynamoDBAMCExecutionStatus:
+    Type: "AWS::DynamoDB::Table"
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: workflowId
+          AttributeType: S
+        - AttributeName: workflowExecutionId
+          AttributeType: S
+        - AttributeName: executionStatus
+          AttributeType: S
+      BillingMode: PROVISIONED
+      KeySchema:
+        - AttributeName: workflowId
+          KeyType: HASH
+        - AttributeName: workflowExecutionId
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      StreamSpecification: 
+        StreamViewType: NEW_AND_OLD_IMAGES
+      SSESpecification:
+        SSEEnabled: False
+      TimeToLiveSpecification:
+        AttributeName: expireTimestamp
+        Enabled: True
+      GlobalSecondaryIndexes :
+        - 
+          IndexName: !Join ['_', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "AMCExecutionStatusGSI"]]
+          KeySchema: 
+            - 
+              AttributeName: "executionStatus"
+              KeyType: "HASH"
+            - 
+              AttributeName: "workflowId"
+              KeyType: "RANGE"
+          Projection: 
+            NonKeyAttributes: 
+              - "workflowExecutionId"
+              - "createTime"
+              - "invalidationOffsetSecs"
+              - "lastUpdatedTime"
+              - "outputS3URI"
+              - "timeWindowStart"
+              - "timeWindowEnd"
+            ProjectionType: "INCLUDE"
+          ProvisionedThroughput: 
+            ReadCapacityUnits: "5"
+            WriteCapacityUnits: "5"
+  
+      TableName: !Join ['_', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "AMCExecutionStatus"]]
+
+######## CLOUD WATCH RULES ######  
+  rRunProcessGlueCrawlerRunRequests: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "Runs the process-glue-crawler-run-requests lambda function every minute"
+      ScheduleExpression: "rate(1 minute)"
+      State: "ENABLED"
+      Targets: 
+        - 
+          Arn: !GetAtt rLambdaProcessGlueCrawlerRunRequests.Arn 
+          Id: "ProcessGlueCrawlerRunRequests"
+
+  PermissionForProcessCrawlerRequestToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !GetAtt rLambdaProcessGlueCrawlerRunRequests.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt rRunProcessGlueCrawlerRunRequests.Arn
+
+  rGetAllGlueExecutionStatuses: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "Runs the process-glue-crawler-run-requests lambda function every 10 minutes"
+      ScheduleExpression: "rate(10 minutes)"
+      State: "ENABLED"
+      Targets: 
+        - 
+          Arn: !GetAtt rLambdaAMCAPIInterface.Arn 
+          Id: "ProcessGlueCrawlerRunRequests"
+          Input: '{ "method": "getAllExecutionStatuses" }'
+
+  PermissionForGetExecutionStatusesToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !GetAtt rLambdaAMCAPIInterface.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt rGetAllGlueExecutionStatuses.Arn
+
+######## STATE MACHINE #########
+  rStateMachineRoute:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      StateMachineName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "sm-route"]]
+      DefinitionString: !Sub
+        - |-
+          {
+            "Comment": "A State machine that accetps S3 events and determines how files should be processed based upon the key name, file name, file size, extension etc.",
+            "StartAt": "classify-s3-event-type",
+            "States": {
+              "classify-s3-event-type": {
+                "Type": "Task",
+                "Resource": "${classifyS3EventType}",
+                "Catch":[
+                  {
+                    "ResultPath": "$.error-info",
+                    "ErrorEquals":[
+                      "States.ALL"
+                    ],
+                    "Next":"ReportError"
+                  }
+                ],
+                "ResultPath": "$.classify",
+                "Next": "validate-small-text-files"
+              },
+              "validate-small-text-files": {
+                "Type": "Task",
+                "Resource": "${validateSmallTextFiles}",
+                "Catch":[
+                  {
+                    "ResultPath": "$.error-info",
+                    "ErrorEquals":[
+                      "States.ALL"
+                    ],
+                    "Next": "ReportError"
+                  }
+                ],
+                "ResultPath": "$.validatesmalltext",
+                "Next": "route-s3-event"
+              },
+              "route-s3-event": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "And": [
+                      {
+                        "Variable": "$.validatesmalltext.isTextFile",
+                        "BooleanEquals": true
+                      },
+                      {
+                        "Variable": "$.validatesmalltext.valid",
+                        "BooleanEquals": false
+                      }
+                    ],
+                    "Next": "skip-single-line-textfile"
+                  },
+                  {
+                    "And": [
+                      {
+                        "Variable": "$.classify.s3ItemType",
+                        "StringEquals": "AMCWORKFLOW"
+                      },
+                      {
+                        "Variable": "$.validatesmalltext.valid",
+                        "BooleanEquals": true
+                      }
+                    ],
+                    "Next": "amc-s3-repartitioning"
+                  },
+                  {
+                    "And": [
+                      {
+                        "Variable": "$.classify.s3ItemType",
+                        "StringEquals": "DATAIMPORT"
+                      },
+                      {
+                        "Variable": "$.validatesmalltext.valid",
+                        "BooleanEquals": true
+                      }
+                    ],
+                    "Next": "process-import-data"
+                  }
+                ],
+                "Default": "invalid-input"
+              },
+              "process-import-data": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::states:startExecution",
+                "Parameters": {
+                  "Input.$": "$",
+                   "StateMachineArn": "${processImportStateMachine}",
+                  "Name.$": "$.messageId"
+                },
+                "Catch": [
+                  {
+                    "ResultPath":"$.error-info",
+                    "ErrorEquals":[
+                      "States.ALL"
+                    ],
+                    "Next": "ReportError"
+                  }
+                ],
+                "End": true
+              },
+              "amc-s3-repartitioning": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::states:startExecution",
+                "Parameters": {
+                  "Input.$": "$",
+                  "StateMachineArn": "${processAmcCsvStateMachine}",
+                  "Name.$": "$.messageId"
+                },
+                "Catch": [
+                  {
+                    "ResultPath":"$.error-info",
+                    "ErrorEquals":[
+                      "States.ALL"
+                    ],
+                    "Next": "ReportError"
+                  }
+                ],
+                "End": true
+              },
+              "invalid-input": {
+                "Type": "Fail",
+                "Cause": "Invalid input file"
+              },
+              "skip-single-line-textfile": {
+                "Type": "Pass",
+                "End": true
+              },
+              "ReportError": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${errorStateTopicArn}",
+                      "Message": {
+                      "StateMachine.$": "$$.StateMachine.Id",
+                      "Execution.$": "$$.Execution",
+                      "State.$": "$$.State",
+                      "Input.$": "$"
+                }
+                },
+              "End": true
+              }
+            }
+          }
+        - {
+            classifyS3EventType: !GetAtt rLambdaClassifyS3Event.Arn,
+            validateSmallTextFiles: !GetAtt rLambdaValidateSmallTextFiles.Arn,
+            processImportStateMachine: !Ref rStateMachineProcessImportData,
+            processAmcCsvStateMachine: !Ref rStateMachineProcessAmcCsv,
+            errorStateTopicArn: !Ref rSnsTopic
+
+          }
+      RoleArn: !GetAtt rRoleStateMachine.Arn
+
+  rStateMachineProcessImportData:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      StateMachineName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "sm-ProcessImportData"]]
+      DefinitionString: !Sub
+        - |-
+          {
+            "Comment": "A State machine that prepares generic CSV Data by moving the data and creating/running glue crawlers",
+            "StartAt": "import-input-file",
+            "States": {
+              "import-input-file": {
+                "Type": "Task",
+                "Resource": "${ImportInputFile}",
+                "Catch": [
+                  {
+                    "ResultPath": "$.ImportInputFile-error-info",
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Next": "ReportError"
+                  }
+                ],
+                "Next": "get-glue-crawler-status"
+              },
+              "get-glue-crawler-status": {
+                "Type": "Task",
+                "Resource": "${getGlueCrawlerStatus}",
+                "ResultPath": "$.status",
+                "Next": "evaluate-crawler-status",
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 10,
+                    "BackoffRate": 1.5
+                  }
+                ],
+                "Catch": [
+                  {
+                    "ResultPath": "$.error-info",
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Next": "ReportError"
+                  }
+                ]
+              },
+              "evaluate-crawler-status": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.status.crawlerExists",
+                    "BooleanEquals": false,
+                    "Next": "create-glue-s3-crawler"
+                  },
+                  {
+                    "And": [
+                      {
+                        "Variable": "$.status.crawlerContainsTableBaseS3Location",
+                        "BooleanEquals": true
+                      },
+                      {
+                        "Variable": "$.status.crawlerMatchesTablePrefix",
+                        "BooleanEquals": true
+                      }
+                    ],
+                    "Next": "queue-crawler-run"
+                  },
+                  {
+                    "And": [
+                      {
+                        "Variable": "$.status.crawlerState",
+                        "StringEquals": "READY"
+                      },
+                      {
+                        "Or": [
+                          {
+                            "Variable": "$.status.crawlerContainsTableBaseS3Location",
+                            "BooleanEquals": false
+                          },
+                          {
+                            "Variable": "$.status.crawlerMatchesTablePrefix",
+                            "BooleanEquals": false
+                          }
+                        ]
+                      }
+                    ],
+                    "Next": "delete-glue-crawler"
+                  }
+                ],
+                "Default": "wait_sixty_seconds"
+              },
+              "wait_sixty_seconds": {
+                "Type": "Wait",
+                "Seconds": 60,
+                "Next": "get-glue-crawler-status"
+              },
+              "create-glue-s3-crawler": {
+                "Type": "Task",
+                "Resource": "${createGlueS3Crawler}",
+                "Next": "get-glue-crawler-status",
+                "ResultPath": "$.createcrawler",
+                "Catch": [
+                  {
+                    "ResultPath": "$.createcrawler-error-info",
+                    "ErrorEquals": [
+                      "AlreadyExistsException"
+                    ],
+                    "Next": "get-glue-crawler-status"
+                  },
+                  {
+                    "ResultPath": "$.error-info",
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Next": "ReportError"
+                  }
+                ]
+              },
+              "delete-glue-crawler": {
+                "Type": "Task",
+                "Resource": "${deleteGlueCrawler}",
+                "Next": "create-glue-s3-crawler",
+                "ResultPath": "$.deletecrawler",
+                "Catch": [
+                  {
+                    "ResultPath": "$.deletecrawler-error-info",
+                    "ErrorEquals": [
+                      "EntityNotFoundException"
+                    ],
+                    "Next": "get-glue-crawler-status"
+                  },
+                  {
+                    "ResultPath": "$.error-info",
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Next": "ReportError"
+                  }
+                ]
+              },
+              "queue-crawler-run": {
+                "Type": "Task",
+                "Resource": "${queueCrawlerRun}",
+                "ResultPath": "$.queuecrawler",
+                "Catch": [
+                  {
+                    "ResultPath": "$.queuecrawler-error-info",
+                    "ErrorEquals": [
+                      "CrawlerRunningException",
+                      "EntityNotFoundException"
+                    ],
+                    "Next": "get-glue-crawler-status"
+                  },
+                  {
+                    "ResultPath": "$.error-info",
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Next": "ReportError"
+                  }
+                ],
+                "End": true
+              },
+              "ReportError": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${errorStateTopicArn}",
+                      "Message": {
+                      "StateMachine.$": "$$.StateMachine.Id",
+                      "Execution.$": "$$.Execution",
+                      "State.$": "$$.State",
+                      "Input.$": "$"
+                }
+                },
+              "End": true
+              }
+            }
+          }
+        - {
+            ImportInputFile: !GetAtt rLambdaImportInputFile.Arn,
+            getGlueCrawlerStatus: !GetAtt rLambdaGetGlueCrawlerStatus.Arn,
+            createGlueS3Crawler: !GetAtt rLambdaCreateGlueCrawler.Arn,
+            deleteGlueCrawler: !GetAtt rLambdaDeleteGlueCrawler.Arn,
+            queueCrawlerRun: !GetAtt rLambdaQueueCrawlerRun.Arn,
+            errorStateTopicArn: !Ref rSnsTopic
+          }
+      RoleArn: !GetAtt rRoleStateMachine.Arn
+
+  rStateMachineProcessAmcCsv:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      StateMachineName: !Join ['-', [!Ref pOrganizationName, !Ref pApplicationName, !Ref pEnvironment, !Ref pDataset, "sm-ProcessAMCCSV"]]
+      DefinitionString: !Sub
+        - |-
+          {
+            "Comment": "A State machine that prepares CSV Data by repartitioning the data and creating/running glue crawlers",
+            "StartAt": "route-csv-by-size",
+            "States": {
+              "route-csv-by-size": {
+                "Type": "Choice",
+                  "Choices": [
+                  {
+                  "Variable": "$.classify.fileSize",
+                  "NumericGreaterThanEquals": 100000000,
+                  "Next": "amc-s3-repartitioning1G"
+                  }
+                ],
+              "Default": "amc-s3-repartitioning"
+              },
+              "amc-s3-repartitioning": {
+                "Type": "Task",
+                "Resource": "${amcS3CsvRepartitioning}",
+                "Catch": [
+                  {
+                    "ResultPath": "$.error-info",
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Next": "ReportError"
+                  }
+                ],
+                "Next": "amc-s3-email-subscriptions"
+              },
+              "amc-s3-repartitioning1G": {
+                "Type": "Task",
+                "Resource": "${amcS3CsvRepartitioning1G}",
+                "Catch": [
+                  {
+                    "ResultPath": "$.error-info",
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Next": "ReportError"
+                  }
+                ],
+                "Next": "amc-s3-email-subscriptions"
+              },
+              "amc-s3-email-subscriptions": {
+                "Type": "Task",
+                "Resource": "${AMCSubscriptions}",
+                "ResultPath": "$.subscriptions",
+                "Catch": [
+                  {
+                    "ResultPath": "$.error-info",
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Next": "ReportError"
+                  }
+                ],
+                "Next": "get-glue-crawler-status"
+              },
+              
+              "get-glue-crawler-status": {
+                "Type": "Task",
+                "Resource": "${getGlueCrawlerStatus}",
+                "ResultPath": "$.status",
+                "Next": "evaluate-crawler-status",
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 10,
+                    "BackoffRate": 1.5
+                  }
+                ],
+                "Catch": [
+                  {
+                    "ResultPath": "$.error-info",
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Next": "ReportError"
+                  }
+                ]
+              },
+              "evaluate-crawler-status": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.status.crawlerExists",
+                    "BooleanEquals": false,
+                    "Next": "create-glue-s3-crawler"
+                  },
+                  {
+                    "And": [
+                      {
+                        "Variable": "$.status.crawlerContainsTableBaseS3Location",
+                        "BooleanEquals": true
+                      },
+                      {
+                        "Variable": "$.status.crawlerMatchesTablePrefix",
+                        "BooleanEquals": true
+                      }
+                    ],
+                    "Next": "queue-crawler-run"
+                  },
+                  {
+                    "And": [
+                      {
+                        "Variable": "$.status.crawlerState",
+                        "StringEquals": "READY"
+                      },
+                      {
+                        "Or": [
+                          {
+                            "Variable": "$.status.crawlerContainsTableBaseS3Location",
+                            "BooleanEquals": false
+                          },
+                          {
+                            "Variable": "$.status.crawlerMatchesTablePrefix",
+                            "BooleanEquals": false
+                          }
+                        ]
+                      }
+                    ],
+                    "Next": "delete-glue-crawler"
+                  }
+                ],
+                "Default": "wait_sixty_seconds"
+              },
+              "wait_sixty_seconds": {
+                "Type": "Wait",
+                "Seconds": 60,
+                "Next": "get-glue-crawler-status"
+              },
+              "create-glue-s3-crawler": {
+                "Type": "Task",
+                "Resource": "${createGlueS3Crawler}",
+                "Next": "get-glue-crawler-status",
+                "ResultPath": "$.createcrawler",
+                "Catch": [
+                  {
+                    "ResultPath": "$.createcrawler-error-info",
+                    "ErrorEquals": [
+                      "AlreadyExistsException"
+                    ],
+                    "Next": "get-glue-crawler-status"
+                  },
+                  {
+                    "ResultPath": "$.error-info",
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Next": "ReportError"
+                  }
+                ]
+              },
+              "delete-glue-crawler": {
+                "Type": "Task",
+                "Resource": "${deleteGlueCrawler}",
+                "Next": "create-glue-s3-crawler",
+                "ResultPath": "$.deletecrawler",
+                "Catch": [
+                  {
+                    "ResultPath": "$.deletecrawler-error-info",
+                    "ErrorEquals": [
+                      "EntityNotFoundException"
+                    ],
+                    "Next": "get-glue-crawler-status"
+                  },
+                  {
+                    "ResultPath": "$.error-info",
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Next": "ReportError"
+                  }
+                ]
+              },
+              "queue-crawler-run": {
+                "Type": "Task",
+                "Resource": "${queueCrawlerRun}",
+                "ResultPath": "$.queuecrawler",
+                "Catch": [
+                  {
+                    "ResultPath": "$.queuecrawler-error-info",
+                    "ErrorEquals": [
+                      "CrawlerRunningException",
+                      "EntityNotFoundException"
+                    ],
+                    "Next": "get-glue-crawler-status"
+                  },
+                  {
+                    "ResultPath": "$.error-info",
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Next": "ReportError"
+                  }
+                ],
+                "End": true
+              },
+              "ReportError": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${errorStateTopicArn}",
+                "Message": {
+                "StateMachine.$": "$$.StateMachine.Id",
+                "Execution.$": "$$.Execution",
+                "State.$": "$$.State",
+                "Input.$": "$"
+                }
+                },
+              "End": true
+              }
+            }
+          }
+        - {
+            amcS3CsvRepartitioning: !GetAtt rLambdaAmcS3Repartitioning.Arn,
+            amcS3CsvRepartitioning1G: !GetAtt rLambdaAmcS3Repartitioning1G.Arn,
+            AMCSubscriptions: !GetAtt rLambdaAMCSubscriptions.Arn,
+            getGlueCrawlerStatus: !GetAtt rLambdaGetGlueCrawlerStatus.Arn,
+            createGlueS3Crawler: !GetAtt rLambdaCreateGlueCrawler.Arn,
+            deleteGlueCrawler: !GetAtt rLambdaDeleteGlueCrawler.Arn,
+            queueCrawlerRun: !GetAtt rLambdaQueueCrawlerRun.Arn,
+            errorStateTopicArn: !Ref rSnsTopic
+          }
+      RoleArn: !GetAtt rRoleStateMachine.Arn
+########################################################################
+
+######## SSM OUTPUTS #########
+  rOrganizationSsm:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: !Sub /${pOrganizationName}/${pApplicationName}/${pDataset}/Misc/pOrg
+      Type: "String"
+      Value: !Ref pOrganizationName
+      Description: "Name of the Organization owning the datalake"
+  rApplicationSsm:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: !Sub /${pOrganizationName}/${pApplicationName}/${pDataset}/Misc/pApp
+      Type: "String"
+      Value: !Ref pApplicationName
+      Description: "Name of the Application"
+  rGlueDataCatalogSsm:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: !Sub /${pOrganizationName}/${pApplicationName}/${pDataset}/Glue/DataCatalog
+      Type: "String"
+      Value: !Ref rGlueDataCatalog
+      Description: "Name of the Glue job used for the data catalog"
+  rS3StageBucketSsm:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: !Sub /${pOrganizationName}/${pApplicationName}/${pDataset}/S3/StageBucket
+      Type: "String"
+      Value: !Ref rStageBucket
+      Description: "Name of the Stage S3 bucket"
+  rS3AnalyticsBucketSsm:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: !Sub /${pOrganizationName}/${pApplicationName}/${pDataset}/S3/AnalyticsBucket
+      Type: "String"
+      Value: !Ref rAnalyticsBucket
+      Description: "Name of the Analytics S3 bucket"
+  rQueueRoutingSsm:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: !Sub /${pOrganizationName}/${pApplicationName}/${pDataset}/SQS/QueueRouting
+      Type: "String"
+      Value: !Ref rQueueRouting
+      Description: "URL of routing queue"
+  rStateMachineSsm:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: !Sub /${pOrganizationName}/${pApplicationName}/${pDataset}/SM/${pDataset}SM
+      Type: "String"
+      Value: !Ref rStateMachineProcessAmcCsv
+      Description: !Sub "ARN of the ${pDataset} State Machine"
+
+#############################################
+
+Outputs:
+  oGlueDataCatalog:
+    Value: !Ref rGlueDataCatalog
+    Description: "Glue Data Catalog"
+  oStageBucket:
+    Value: !Ref rStageBucket
+    Description: "Data Lake Stage Bucket"
+  oAnalyticsBucket:
+    Value: !Ref rAnalyticsBucket
+    Description: "Data Lake Analytics Bucket"
+  oAmcBucketName:
+    Value: !Sub ${pAmcBucketName}
+    Description: "S3 Bucket AMC Instance is writing to"
+  oAMCAPIEndPointUrl:
+    Description: "AMC API Endpoint URL"
+    Value: !Sub ${pAMCAPIEndPointUrl}
+  oAMCOrangeAccountNumber:
+    Description: "Orange AWS Account Number for AMC Instance"
+    Value: !Sub ${pAMCOrangeAccountNumber}
+  oAMCGreenAccountNumber:
+    Description: "Green AWS Account Number for AMC Instance"
+    Value: !Sub ${pAMCGreenAccountNumber}
+  oAMCBlueAccountNumber:
+    Description: "Blue AWS Account Number for AMC Instance"
+    Value: !Sub ${pAMCBlueAccountNumber}
+  oAMCInstanceID:
+    Description: "ID for the AMC Instance"
+    Value: !Sub ${pAMCInstanceID}
